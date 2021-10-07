@@ -3,12 +3,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
+#include <list>
 #include <map>
 #include <mutex>
 #include <thread>
 #include <utility>
-#include <list>
-#include <iostream>
 
 namespace timer
 {
@@ -20,19 +20,8 @@ struct TickBehaviour
 class ConstSleepingTimeBetweenTicks : public TickBehaviour
 {
 public:
-    template<typename Functor>
-    ConstSleepingTimeBetweenTicks(unsigned intervalMillis, Functor&& callback)
-        : callback_(callback)
-        , intervalMillis_(intervalMillis)
-    {
-    }
-
-    void operator()() override
-    {
-        auto sleepingTime = std::chrono::microseconds(1000 * intervalMillis_);
-        std::this_thread::sleep_for(sleepingTime);
-        callback_();
-    }
+    ConstSleepingTimeBetweenTicks(unsigned intervalMillis, std::function<void()> callback);
+    void operator()() override;
 
 private:
     std::function<void()> callback_;
@@ -42,25 +31,8 @@ private:
 class ConstTimeBetweenTicks : public TickBehaviour
 {
 public:
-    template<typename Functor>
-    ConstTimeBetweenTicks(unsigned intervalMillis, Functor&& callback)
-        : callback_(std::forward<Functor>(callback))
-        , intervalMillis_(intervalMillis)
-        , sleepingTime(1000 * intervalMillis_)
-    {
-    }
-
-    void operator()() override
-    {
-        std::this_thread::sleep_for(std::chrono::microseconds(sleepingTime));
-        const auto wakeupTime = std::chrono::high_resolution_clock::now();
-        (callback_)();
-        const auto processingTime = std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::high_resolution_clock::now() - wakeupTime)
-                                        .count();
-        const long long intervalMicros = 1000 * intervalMillis_;
-        sleepingTime = processingTime >= intervalMicros ? 0 : intervalMicros - processingTime;
-    }
+    ConstTimeBetweenTicks(unsigned intervalMillis, std::function<void()> callback);
+    void operator()() override;
 
 private:
     std::function<void()> callback_;
@@ -70,52 +42,13 @@ private:
 
 class Timer
 {
-    friend struct TickBehaviour;
-
 public:
-    template<typename Functor>
-    Timer(unsigned intervalMillis, Functor&& callback)
-        : tickBehaviour_(std::make_unique<ConstSleepingTimeBetweenTicks>(&callback_, &intervalMillis_))
-    {
-    }
-
-    template<typename Functor>
-    Timer(std::unique_ptr<TickBehaviour> tickBehaviour)
-        : tickBehaviour_(std::move(tickBehaviour))
-    {
-    }
-
-    ~Timer()
-    {
-        isRunning_ = false;
-        worker_.join();
-    }
-
-    inline void start()
-    {
-        std::lock_guard lock(mutex_);
-        if (isRunning_)
-        {
-            return;
-        }
-        isRunning_ = true;
-        worker_ = std::thread([this] {
-            while (isRunning_)
-            {
-                (*tickBehaviour_)();
-            }
-        });
-    }
-
-    inline void reset()
-    {
-    }
-
-    inline void stop()
-    {
-        std::lock_guard lock(mutex_);
-        isRunning_ = false;
-    }
+    Timer(unsigned intervalMillis, std::function<void()> callback);
+    Timer(std::unique_ptr<TickBehaviour> tickBehaviour);
+    ~Timer();
+    inline void start();
+    inline void reset();
+    inline void stop();
 
 private:
     std::unique_ptr<TickBehaviour> tickBehaviour_;
@@ -126,87 +59,44 @@ private:
 
 class SingleShotTimer
 {
-public:
-    template<typename Functor>
-    static void call(long long waitForMillis, Functor&& callback)
+    enum class OnExitThreadBehaviour
     {
-        static SingleShotTimer instance;
-        auto currentMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::high_resolution_clock::now().time_since_epoch())
-                                 .count();
-        instance.callbacks_.insert({currentMillis + waitForMillis, {std::forward<Functor>(callback)}});
-        instance.wakeUp();
-    }
+        Join,
+        Detatch
+    };
+    class ThreadManager
+    {
+    public:
+        ThreadManager();
+        ~ThreadManager();
+        void setOnExitThreadBehaviour(OnExitThreadBehaviour behaviour);
+        unsigned addThread(unsigned threadId, std::thread&& thread);
+        void removeThread(unsigned id);
+
+    private:
+        void removePendingThreads();
+        void runDeleter();
+        void joinThreads();
+        void detatchThreads();
+
+        std::vector<unsigned> idsOfThreadsToRemove_;
+        std::map<unsigned, std::thread> threads_;
+        std::thread deleter_;
+        std::mutex mutex_;
+        std::condition_variable monitor_;
+        bool isRunning_ = true;
+        OnExitThreadBehaviour onExitThreadBehaviour_ = OnExitThreadBehaviour::Detatch;
+    };
+
+public:
+    static void call(unsigned waitForMillis, std::function<void()> callback);
+    static void setOnExitThreadBehaviour(OnExitThreadBehaviour behaviour);
 
 private:
-    SingleShotTimer(){}
-    void wakeUp()
-    {
-        monitor_.notify_all();
-    }
+    static SingleShotTimer& instance();
 
-    void sleep()
-    {
-        std::unique_lock lock(mutex_);
-        monitor_.wait(lock);
-    }
-
-    void sleepFor(long long millis)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(millis));
-    }
-
-    bool shouldCallbacksBeCalled()
-    {
-        auto element = callbacks_.begin();
-        if (element != callbacks_.end())
-        {
-            auto currentMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::high_resolution_clock::now().time_since_epoch())
-                                     .count();
-            return (*element).first <= currentMillis;
-        }
-        return false;
-    }
-
-    void processCurrentCalbacks()
-    {
-        for (const auto& callback : callbacks_.begin()->second)
-        {
-            callback();
-        }
-        callbacks_.erase(callbacks_.begin());
-    }
-
-    void run()
-    {
-        while (isRunning_)
-        {
-            std::cout << "running" << std::endl;
-            if (shouldCallbacksBeCalled())
-            {
-                processCurrentCalbacks();
-            }
-            if (callbacks_.empty())
-            {
-                sleep();
-            }
-            else
-            {
-                auto currentMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::high_resolution_clock::now().time_since_epoch())
-                                     .count();
-                auto timeToNextCallback = callbacks_.begin()->first - currentMillis;
-                sleepFor(timeToNextCallback);
-            }
-        }
-    }
-
-    std::map<long long, std::list<std::function<void()>>> callbacks_;
-    std::condition_variable monitor_;
+    unsigned nextId_ = 0;
     std::mutex mutex_;
-    std::thread worker_{[this] { run(); }};
-    unsigned currentTime_;
-    bool isRunning_ = true;
+    ThreadManager threadManager_;
 };
 }  // namespace timer
