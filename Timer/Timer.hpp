@@ -46,9 +46,9 @@ public:
     Timer(unsigned intervalMillis, std::function<void()> callback);
     Timer(std::unique_ptr<TickBehaviour> tickBehaviour);
     ~Timer();
-    inline void start();
-    inline void reset();
-    inline void stop();
+    void start();
+    void reset();
+    void stop();
 
 private:
     std::unique_ptr<TickBehaviour> tickBehaviour_;
